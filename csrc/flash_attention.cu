@@ -217,7 +217,7 @@ inline __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor
 
 
 
-// Convert acc_layout from (MMA=(2,2), MMA_M=1, MMA_N=8) to (nrow=(2, MMA_M=1), ncol=(2, MMA_N=8))
+// Convert acc_layout from (MMA=(2,2), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 template<typename Layout>
 inline __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 4);
@@ -247,7 +247,7 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
         //  1. 求当前thread内max: 遍历
         //  2. reduce thread间的max: 使用线程数洗牌指令做 all reduce，每个线程都获得了最大值
         reduce_max</*zero_init=*/false>(scores, scores_max); // scores_max 变成最新的最大值，相当于公式中的 m_i^{j}
-        // Reshape acc_o from ((2,2),1,8) to (nrow=(2, 1), ncol=(2, 8))
+        // Reshape acc_o from ((2,2), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         // 将acc_o转换成符合2D直觉的(nrow, ncol)的形状
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         #pragma unroll
@@ -344,7 +344,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // NOTE: 小技巧
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
-  // using TiledMMA = typename Kernel_traits::MMA;
   using TiledMMA = typename Kernel_traits::TiledMma;
   using index_t = typename Kernel_traits::index_t;
   using SmemLayoutQ = typename Kernel_traits::SmemLayoutQ;
@@ -387,20 +386,18 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // 加载Q, K, V分块
   // (kBlockM, kHeadDim, num_tile_n)
   Tensor gQ = local_tile(Q, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(m_block, _));
-
-  // (kBlockN, kHeadDim, num_tile_n)sQ
   // NOTE: loading流水线, 初次加载所需K, V
   Tensor gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(0, _));
-  Tensor gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, 0));
+  Tensor gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_, 0)); // 这里注意 V，因为已经转置了
 
   // 获取MMA抽象
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(tidx);
 
   // Construct SMEM tensors.
-  Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
-  Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
-  Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
+  Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{}); //(kBlockM, kHeadDim)
+  Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{}); //(kBlockN, kHeadDim)
+  Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{}); //(kHeadDim, kBlockN)
 
   // NOTE: copy抽象
   // NOTE: QKV gmem -> smem拷贝的抽象
@@ -418,25 +415,25 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   // NOTE: 定义smem -> reg拷贝的dst
   // partition_fragment与partition类似, 只是返回的是寄存器表示
-  Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)  ((_4,_2,_2),_1,_2)  
-  Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
-  Tensor tOrV  = thr_mma.partition_fragment_B(sV);                // (MMA, MMA_K,MMA_N)
+  Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K) =  ((4, 2, 2), MMA_M, MMA_N)
+  Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K) =  ((4, 2), MMA_N, MMA_K)
+  Tensor tOrV  = thr_mma.partition_fragment_B(sV);                           // (MMA,MMA_K,MMA_N) =  ((2, 2), MMA_M, MMA_N)
  
   // NOTE: 准备拷贝Q, K, V到 reg 的copy对象 (smem --> reg)
   auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
-  Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+  Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ); // tSsQ --> tSrQ
 
   auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
-  Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+  Tensor tSsK = smem_thr_copy_K.partition_S(sK); // tSrK --> tSsK
   
 
   // TODO: 拷贝时转置
   // NOTE: smem->reg拷贝Vt
   auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-  Tensor tOsVt = smem_thr_copy_V.partition_S(sV);
+  Tensor tOsV = smem_thr_copy_V.partition_S(sV); // 因为 V 已经被我们转置了，所以这里寄存器 tensor 的名字加个 t
 
   // NOTE: 命名规则, t表示to, s/g表示位置(smem, gmem)
   // 从smem加载时做retiling
@@ -454,29 +451,23 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   Tensor rAccOut = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{}); // （MMA, MMA_M, MMA_K)
 
-  // step1: slice-k compute QK block
-  // Q[BLOCK_M, BLOCK_N] @ K[BLOCK_M, BLOCK_N].T = O[BLOCK_M, BLOCK_M]
-  //
-  // step2:
-  // advance K, V
-
   // NOTE: K, V分块的数量: 处理的区间
   const int n_block_min = 0;
   // NOTE: 1. mask between N BLOCKs if is causal mode
   int seqlen_start = m_block * kBlockM;
   int seqlen_end = (m_block + 1) * kBlockM;
-  int n_block_max = Is_causal ? cute::ceil_div(seqlen_end, kBlockN) : cute::ceil_div(params.k_seqlen, kBlockN); // （2 * MMA_M）
+  int n_block_max = Is_causal ? cute::ceil_div(seqlen_end, kBlockN) : cute::ceil_div(params.k_seqlen, kBlockN); 
 
   // NOTE: 需要记录的max
-  Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(rAccOut)>>{});
+  Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(rAccOut)>>{}); // （2 * MMA_M）
 
-  // NOTE: 需要记录的denom
-  Tensor scores_sum = make_fragment_like(scores_max);
+  // NOTE: 需要记录的 softmax 分母
+  Tensor scores_sum = make_fragment_like(scores_max); // （2 * MMA_M）
 
-  clear(rAccOut);
+  clear(rAccOut); // （MMA=(2,2), MMA_M, MMA_K), 初始化为 0 
 
   for (int nbi = n_block_min; nbi < n_block_max; nbi++) {
-    auto rAccScore = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}); //(MMA=(2,2), MMA_M=1, MMA_N=8)
+    auto rAccScore = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}); //(MMA=(2,2), MMA_M, MMA_N)
     clear(rAccScore); // 初始化为 0
 
     // 等待Q, K的gmem -> smem拷贝完成, 即Q, K就绪
@@ -485,7 +476,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     __syncthreads();
 
     // gemm的同时异步加载V
-    // gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(nbi, _));
     gV = local_tile(V, make_tile(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_,  nbi));
     tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
     // 异步加载V到smem
@@ -499,7 +489,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
         smem_thr_copy_Q, smem_thr_copy_K
     );
 
-    // NOTE: Convert from layout C to layout A;  ((2, 2),(1, 8)) --> ((2, 1),(2, 8))
+    // NOTE: Convert from layout C to layout A;  (MMA=(2, 2),(MMA_M, MMA_N)) --> ((2, MMA_M),(2, MMA_N))
     Tensor scores = make_tensor(rAccScore.data(), flash::convert_layout_acc_rowcol(rAccScore.layout()));
 
     // NOTE: 2. mask within N BLOCKs
@@ -507,7 +497,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
       flash::mask_within_nblock<kBlockM, kBlockN, kNWarps>(scores, m_block, nbi);
     }
   
-
     // NOTE: 等待V加载完成, 为下个K加载准备初始状态
     flash::cp_async_wait<0>();
     __syncthreads();
@@ -536,11 +525,13 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
     Tensor rP = flash::convert_float32_to_fp8<Element>(rAccScore);
     auto reg2reg = ReorgCFp8toAFp8();
     reg2reg(rP);
-    // NOTE: Convert from layout C to layout A;  ((2, 2),(1, 8)) --> ((4, 2, 2),(1, 2))
-    auto tOrPLayout = ReshapeTStoTP()(rP, tSrQ);
+    // NOTE: Convert from layout C to layout A;  (MMA=(2, 2), MMA_M, MMA_N)) --> (MMA=(4, 2, 2), MMA_M, MMA_N))
+    // 这里由于写死了 kBlockM, KBlockN 都为64，所以第一个 gemm 的输出总是为(64，64), 因此根据 MMA 指令集的特性，可以容易算出 MMA_M = 1, MMA_N = 2
+    //（我暂时不知道怎么写 layout 除法（针对静态shape），所以目前固定写为下面这种形式）
+    auto tOrPLayout = Layout<Shape<Shape<_4, _2, _2>, _1, _2>>{};
     Tensor tOrP = make_tensor(rP.data(), tOrPLayout);
-    // // rAccOut:((2, 2, 4),(MMA_M, MMA_N))
-    flash::gemm_A_in_regs(rAccOut, tOrP, tOrV, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    // rAccOut:((2, 2),(MMA_M, MMA_N))
+    flash::gemm_A_in_regs(rAccOut, tOrP, tOrV, tOsV, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
   } 
   
   
