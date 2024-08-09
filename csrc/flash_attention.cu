@@ -433,8 +433,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // NOTE: smem->reg拷贝Vt
   auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-  Tensor tOsV = smem_thr_copy_V.partition_S(sV); // 因为 V 已经被我们转置了，所以这里寄存器 tensor 的名字加个 t
-
+  Tensor tOsV = smem_thr_copy_V.partition_S(sV);
   // NOTE: 命名规则, t表示to, s/g表示位置(smem, gmem)
   // 从smem加载时做retiling
   // tKgK表示gmem中的K, 用作gmem->smem的src
@@ -546,8 +545,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
     float sum = scores_sum(mi);
     float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
-    // compute lse
-    // NOTE: here we use max * scale 
     float scale = inv_sum;
     // for col
     #pragma unroll

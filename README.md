@@ -7,3 +7,4 @@ git submodule update
 python setup.py install
 python test.py
 ```
+![性能对比](./benchmark.png)
