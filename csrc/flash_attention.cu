@@ -579,12 +579,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   __syncthreads();
 
   // NOTE:: 再拷贝到gmem
-
-  // TODO: review, 这里两个copy的作用
-  Tensor tOrO = make_tensor<Element>(shape(tOgO));
-  cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
-
-  flash::copy(gmem_tiled_copy_O, tOrO, tOgO);
+  cute::copy(gmem_tiled_copy_O, tOsO, tOgO);
   
 }
 
